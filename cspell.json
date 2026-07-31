@@ -1,0 +1,14 @@
+{
+    "ignoreWords": [],
+    "words": [
+        "docbox",
+        "serde",
+        "thiserror",
+        "dotenv",
+        "dotenvy",
+        "indicatif",
+        "reqwest",
+        "Jacobtread",
+        "rustls"
+    ]
+}
