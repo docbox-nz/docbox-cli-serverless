@@ -15,7 +15,7 @@ dotenvy = "=0.15.7"
 clap = { version = "=4.6.4", features = ["derive"] }
 
 # Management access
-docbox-management = { version = "0.12.2" }
+docbox-management-interface = { version = "0.1.0" }
 
 # Asynchronous runtime & Helpers
 tokio = { version = "=1.53.1", features = ["full"] }
@@ -39,11 +39,21 @@ aws-sdk-lambda = { version = "1.117.0", default-features = false, features = [
   "default-https-client",
   "rt-tokio",
 ] }
+uuid = { version = "1.24.0", features = ["v4"] }
+
+aws-config = { version = "1.10.1", default-features = false, features = [
+  "behavior-version-latest",
+  "credentials-process",
+  "default-https-client",
+  "rt-tokio",
+  "sso",
+] }
+
 
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
 lto = "thin"
 
-# [patch.crates-io]
-# docbox-management = { version = "0.11.0", path = "../docbox/packages/docbox-management" }
+[patch.crates-io]
+docbox-management-interface = { version = "0.1.0", path = "../docbox/packages/docbox-management-interface" }

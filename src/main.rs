@@ -1,29 +1,24 @@
-use aws_sdk_lambda::primitives::Blob;
 use clap::{Parser, Subcommand, ValueEnum};
 use comfy_table::{Cell, Table, modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL};
-use docbox_management::{
-    core::aws::{aws_config, aws_config_with_profile},
-    database::models::tenant::TenantId,
-    tenant::{
-        MigrateTenantsOutcome, create_tenant::CreateTenantConfig,
-        delete_tenant::DeleteTenantOptions, migrate_tenants::MigrateTenantsConfig,
-        migrate_tenants_search::MigrateTenantsSearchConfig,
-        migrate_tenants_storage::MigrateTenantsStorageConfig,
-    },
+use docbox_management_interface::{
+    CreateTenantInput, DeleteTenantInput, DeleteTenantOptions, DocboxManagementInterface,
+    FailedTenantMigration, GetTenantInput, GetTenantsInput, MigrateTenantIAMInput,
+    MigrateTenantInput, RemoteDocboxManagementInterface, SetTenantAllowedCorsOriginsInput,
 };
-use eyre::{Context, ContextCompat, eyre};
-use serde::de::DeserializeOwned;
+use eyre::{Context, ContextCompat};
 use serde_json::json;
 use std::path::PathBuf;
 use tracing_indicatif::IndicatifLayer;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+use uuid::Uuid;
 
-use crate::commands::{
-    DeleteTenantCommand, GetTenantCommand, GetTenantsCommand, ManagementCommand,
-    MigrateTenantIamCommand, SetTenantAllowedCorsOriginsCommand,
+use crate::{
+    aws_config::{aws_config, aws_config_with_profile},
+    lambda_transport::{FunctionConfig, LambdaManagementTransport},
 };
 
-mod commands;
+mod aws_config;
+mod lambda_transport;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -59,6 +54,14 @@ pub enum OutputFormat {
     Json,
 }
 
+/// Which service the migration is for
+#[derive(Debug, Clone, ValueEnum)]
+pub enum TenantMigrationService {
+    Database,
+    Search,
+    Storage,
+}
+
 #[derive(Subcommand)]
 pub enum Commands {
     /// Initialize the root docbox database
@@ -81,7 +84,7 @@ pub enum Commands {
         env: String,
         /// Specific tenant to delete
         #[arg(short, long)]
-        tenant_id: TenantId,
+        tenant_id: Uuid,
         /// Whether to delete data stored within the tenant
         #[arg(short = 'c', long)]
         delete_contents: Option<bool>,
@@ -118,7 +121,7 @@ pub enum Commands {
         env: String,
         /// Specific tenant to delete
         #[arg(short, long)]
-        tenant_id: TenantId,
+        tenant_id: Uuid,
     },
 
     /// Run a migration
@@ -128,45 +131,17 @@ pub enum Commands {
         env: Option<String>,
         /// Specific tenant to run against
         #[arg(short, long)]
-        tenant_id: Option<TenantId>,
+        tenant_id: Option<Uuid>,
+        /// Whether to ignore failures and continue
         #[arg(short, long)]
         skip_failed: bool,
+        /// Specific service to target
+        #[arg(short, long)]
+        service: Option<TenantMigrationService>,
     },
 
     /// Run a root migration
     MigrateRoot,
-
-    /// Run a search migration
-    MigrateSearch {
-        // Environment to target
-        #[arg(short, long)]
-        env: Option<String>,
-        /// Optional Name of the migration
-        #[arg(short, long)]
-        name: Option<String>,
-        /// Specific tenant to run against
-        #[arg(short, long)]
-        tenant_id: Option<TenantId>,
-        /// Skip failed migrations
-        #[arg(short, long)]
-        skip_failed: bool,
-    },
-
-    /// Run a storage migration
-    MigrateStorage {
-        // Environment to target
-        #[arg(short, long)]
-        env: Option<String>,
-        /// Optional Name of the migration
-        #[arg(short, long)]
-        name: Option<String>,
-        /// Specific tenant to run against
-        #[arg(short, long)]
-        tenant_id: Option<TenantId>,
-        /// Skip failed migrations
-        #[arg(short, long)]
-        skip_failed: bool,
-    },
 
     /// Set the allowed CORS origins for a tenant
     /// (Overrides existing CORS configuration)
@@ -176,7 +151,7 @@ pub enum Commands {
         env: String,
         /// ID of the tenant to target
         #[arg(short, long)]
-        tenant_id: TenantId,
+        tenant_id: Uuid,
         /// Allowed origins to set
         #[arg(short, long)]
         origin: Vec<String>,
@@ -189,7 +164,7 @@ pub enum Commands {
         env: String,
         /// Specific tenant to run against
         #[arg(short, long)]
-        tenant_id: Option<TenantId>,
+        tenant_id: Option<Uuid>,
     },
 }
 
@@ -269,17 +244,19 @@ async fn app(args: Args) -> eyre::Result<()> {
         tenant_id: args.function_tenant_id,
     };
 
+    let transport = LambdaManagementTransport { client, config };
+    let interface = RemoteDocboxManagementInterface::new(transport);
+
     match args.command {
         Commands::CreateRoot => {
-            let result: serde_json::Value =
-                invoke_management_command(&client, &config, ManagementCommand::CreateRoot).await?;
+            interface.create_root().await?;
 
             match args.format {
                 OutputFormat::Human => {
                     println!("successfully created root");
                 }
                 OutputFormat::Json => {
-                    println!("{}", serde_json::to_string_pretty(&result)?);
+                    println!("{{}}");
                 }
             }
 
@@ -287,18 +264,10 @@ async fn app(args: Args) -> eyre::Result<()> {
         }
 
         Commands::CheckRoot => {
-            let result: serde_json::Value =
-                invoke_management_command(&client, &config, ManagementCommand::CheckRoot).await?;
-
+            let result = interface.check_root().await?;
             match args.format {
                 OutputFormat::Human => {
-                    let is_initialized = result
-                        .get("is_initialized")
-                        .context("missing is_initialized")?
-                        .as_bool()
-                        .context("expected boolean")?;
-
-                    if is_initialized {
+                    if result.initialized {
                         println!("root is initialized");
                     } else {
                         println!("root is not initialized");
@@ -317,15 +286,11 @@ async fn app(args: Args) -> eyre::Result<()> {
                 .await
                 .context("failed to read tenant file")?;
 
-            let tenant_config: CreateTenantConfig =
+            let tenant_config: CreateTenantInput =
                 serde_json::from_str(&data).context("failed to parse tenant config")?;
 
-            let tenant: serde_json::Value = invoke_management_command(
-                &client,
-                &config,
-                ManagementCommand::CreateTenant(tenant_config),
-            )
-            .await?;
+            let result = interface.create_tenant(tenant_config).await?;
+            let tenant = result.tenant;
 
             tracing::info!(?tenant, "tenant created successfully");
 
@@ -333,31 +298,17 @@ async fn app(args: Args) -> eyre::Result<()> {
                 OutputFormat::Human => {
                     println!("tenant created successfully");
 
-                    let id = tenant
-                        .get("id")
-                        .context("tenant missing id")?
-                        .as_str()
-                        .context("id was not a string")?;
-
-                    let name = tenant
-                        .get("name")
-                        .context("tenant missing id")?
-                        .as_str()
-                        .context("id was not a string")?;
-
-                    let env = tenant
-                        .get("env")
-                        .context("tenant missing id")?
-                        .as_str()
-                        .context("id was not a string")?;
-
                     let mut table = Table::new();
                     table
                         .load_preset(UTF8_FULL)
                         .apply_modifier(UTF8_ROUND_CORNERS)
                         .set_content_arrangement(comfy_table::ContentArrangement::Dynamic)
                         .set_header(vec!["ID", "Name", "Env"])
-                        .add_row(vec![Cell::new(id), Cell::new(name), Cell::new(env)]);
+                        .add_row(vec![
+                            Cell::new(tenant.id),
+                            Cell::new(tenant.name),
+                            Cell::new(tenant.env),
+                        ]);
 
                     println!("{table}")
                 }
@@ -378,10 +329,8 @@ async fn app(args: Args) -> eyre::Result<()> {
             delete_storage,
             permanently_delete_secret,
         } => {
-            let result: serde_json::Value = invoke_management_command(
-                &client,
-                &config,
-                ManagementCommand::DeleteTenant(DeleteTenantCommand {
+            let result = interface
+                .delete_tenant(DeleteTenantInput {
                     env,
                     tenant_id,
                     options: DeleteTenantOptions {
@@ -391,9 +340,8 @@ async fn app(args: Args) -> eyre::Result<()> {
                         delete_storage: delete_storage.unwrap_or_default(),
                         permanently_delete_secret: permanently_delete_secret.unwrap_or_default(),
                     },
-                }),
-            )
-            .await?;
+                })
+                .await?;
 
             match args.format {
                 OutputFormat::Human => {
@@ -408,17 +356,11 @@ async fn app(args: Args) -> eyre::Result<()> {
         }
 
         Commands::GetTenants { env } => {
-            let result: serde_json::Value = invoke_management_command(
-                &client,
-                &config,
-                ManagementCommand::GetTenants(GetTenantsCommand { env }),
-            )
-            .await?;
+            let result = interface.get_tenants(GetTenantsInput { env }).await?;
 
             match args.format {
                 OutputFormat::Human => {
-                    let tenants = result.as_array().context("expected tenants array")?;
-
+                    let tenants = result.tenants;
                     let mut table = Table::new();
                     table
                         .load_preset(UTF8_FULL)
@@ -427,25 +369,11 @@ async fn app(args: Args) -> eyre::Result<()> {
                         .set_header(vec!["ID", "Name", "Env"]);
 
                     for tenant in tenants {
-                        let id = tenant
-                            .get("id")
-                            .context("tenant missing id")?
-                            .as_str()
-                            .context("id was not a string")?;
-
-                        let name = tenant
-                            .get("name")
-                            .context("tenant missing id")?
-                            .as_str()
-                            .context("id was not a string")?;
-
-                        let env = tenant
-                            .get("env")
-                            .context("tenant missing id")?
-                            .as_str()
-                            .context("id was not a string")?;
-
-                        table.add_row(vec![Cell::new(id), Cell::new(name), Cell::new(env)]);
+                        table.add_row(vec![
+                            Cell::new(tenant.id),
+                            Cell::new(tenant.name),
+                            Cell::new(tenant.env),
+                        ]);
                     }
 
                     println!("{table}")
@@ -459,12 +387,11 @@ async fn app(args: Args) -> eyre::Result<()> {
         }
 
         Commands::GetTenant { env, tenant_id } => {
-            let tenant: serde_json::Value = invoke_management_command(
-                &client,
-                &config,
-                ManagementCommand::GetTenant(GetTenantCommand { env, tenant_id }),
-            )
-            .await?;
+            let result = interface
+                .get_tenant(GetTenantInput { env, tenant_id })
+                .await?;
+
+            let tenant = result.tenant.context("tenant not found")?;
 
             match args.format {
                 OutputFormat::Human => {
@@ -474,85 +401,40 @@ async fn app(args: Args) -> eyre::Result<()> {
                         .apply_modifier(UTF8_ROUND_CORNERS)
                         .set_content_arrangement(comfy_table::ContentArrangement::Dynamic);
 
-                    let id = tenant
-                        .get("id")
-                        .context("tenant missing id")?
-                        .as_str()
-                        .context("id was not a string")?;
-
-                    let name = tenant
-                        .get("name")
-                        .context("tenant missing id")?
-                        .as_str()
-                        .context("id was not a string")?;
-
-                    let env = tenant
-                        .get("env")
-                        .context("tenant missing id")?
-                        .as_str()
-                        .context("id was not a string")?;
-
-                    let db_name = tenant
-                        .get("db_name")
-                        .context("tenant missing db_name")?
-                        .as_str()
-                        .context("db_name was not a string")?;
-
-                    let s3_name = tenant
-                        .get("s3_name")
-                        .context("tenant missing s3_name")?
-                        .as_str()
-                        .context("s3_name was not a string")?;
-
-                    let os_index_name = tenant
-                        .get("os_index_name")
-                        .context("tenant missing os_index_name")?
-                        .as_str()
-                        .context("os_index_name was not a string")?;
-
-                    let db_secret_name = tenant
-                        .get("db_secret_name")
-                        .and_then(|value| value.as_str());
-
-                    let db_iam_user_name = tenant
-                        .get("db_iam_user_name")
-                        .and_then(|value| value.as_str());
-
-                    let event_queue_url = tenant
-                        .get("event_queue_url")
-                        .and_then(|value| value.as_str());
-
-                    table.add_row(vec![Cell::new("ID"), Cell::new(id.to_string())]);
-                    table.add_row(vec![Cell::new("Name"), Cell::new(name)]);
-                    table.add_row(vec![Cell::new("Env"), Cell::new(env)]);
-                    table.add_row(vec![Cell::new("DB Name"), Cell::new(db_name)]);
+                    table.add_row(vec![Cell::new("ID"), Cell::new(tenant.id.to_string())]);
+                    table.add_row(vec![Cell::new("Name"), Cell::new(tenant.name)]);
+                    table.add_row(vec![Cell::new("Env"), Cell::new(tenant.env)]);
+                    table.add_row(vec![Cell::new("DB Name"), Cell::new(tenant.db_name)]);
                     table.add_row(vec![
                         Cell::new("DB Secret Name"),
-                        Cell::new(if let Some(value) = db_secret_name {
-                            format!("Some({value}")
+                        Cell::new(if let Some(value) = tenant.db_secret_name {
+                            value
                         } else {
-                            "None".to_string()
+                            "-- None --".to_string()
                         }),
                     ]);
                     table.add_row(vec![
                         Cell::new("DB IAM User Name"),
-                        Cell::new(if let Some(value) = db_iam_user_name {
-                            format!("Some({value}")
+                        Cell::new(if let Some(value) = tenant.db_iam_user_name {
+                            value
                         } else {
-                            "None".to_string()
+                            "-- None --".to_string()
                         }),
                     ]);
-                    table.add_row(vec![Cell::new("Storage Bucket Name"), Cell::new(s3_name)]);
+                    table.add_row(vec![
+                        Cell::new("Storage Bucket Name"),
+                        Cell::new(tenant.s3_name),
+                    ]);
                     table.add_row(vec![
                         Cell::new("Search Index Name"),
-                        Cell::new(os_index_name),
+                        Cell::new(tenant.os_index_name),
                     ]);
                     table.add_row(vec![
                         Cell::new("Event Queue URL"),
-                        Cell::new(if let Some(value) = event_queue_url {
-                            format!("Some({value}")
+                        Cell::new(if let Some(value) = tenant.event_queue_url {
+                            value
                         } else {
-                            "None".to_string()
+                            "-- None --".to_string()
                         }),
                     ]);
 
@@ -570,18 +452,27 @@ async fn app(args: Args) -> eyre::Result<()> {
             env,
             tenant_id,
             skip_failed,
+            service,
         } => {
-            let outcome: MigrateTenantsOutcome = invoke_management_command(
-                &client,
-                &config,
-                ManagementCommand::Migrate(MigrateTenantsConfig {
+            let result = interface
+                .migrate_tenant(MigrateTenantInput {
                     env,
                     tenant_id,
                     skip_failed,
-                    target_migration_name: None,
-                }),
-            )
-            .await?;
+                    name: None,
+                    service: service.map(|service| match service {
+                        TenantMigrationService::Database => {
+                            docbox_management_interface::TenantMigrationService::Database
+                        }
+                        TenantMigrationService::Search => {
+                            docbox_management_interface::TenantMigrationService::Search
+                        }
+                        TenantMigrationService::Storage => {
+                            docbox_management_interface::TenantMigrationService::Storage
+                        }
+                    }),
+                })
+                .await?;
 
             match args.format {
                 OutputFormat::Human => {
@@ -592,40 +483,24 @@ async fn app(args: Args) -> eyre::Result<()> {
                         .set_content_arrangement(comfy_table::ContentArrangement::Dynamic)
                         .set_header(vec!["ID", "Name", "Env", "Outcome"]);
 
-                    for tenant in outcome.applied_tenants {
+                    for tenant in result.applied_tenants {
                         table.add_row(vec![
-                            Cell::new(tenant.tenant_id.to_string()),
+                            Cell::new(tenant.id),
                             Cell::new(tenant.name),
                             Cell::new(tenant.env),
                             Cell::new("Success"),
                         ]);
                     }
-                    for (error, tenant) in outcome.failed_tenants {
+                    for FailedTenantMigration { error, target } in result.failed_tenants {
                         table.add_row(vec![
-                            Cell::new(tenant.tenant_id.to_string()),
-                            Cell::new(tenant.name),
-                            Cell::new(tenant.env),
+                            Cell::new(target.id),
+                            Cell::new(target.name),
+                            Cell::new(target.env),
                             Cell::new(format!("Failed: {error}")),
                         ]);
                     }
 
                     println!("{table}")
-                }
-                OutputFormat::Json => {
-                    println!("{}", serde_json::to_string_pretty(&outcome)?);
-                }
-            }
-
-            Ok(())
-        }
-
-        Commands::MigrateRoot => {
-            let result: serde_json::Value =
-                invoke_management_command(&client, &config, ManagementCommand::MigrateRoot).await?;
-
-            match args.format {
-                OutputFormat::Human => {
-                    println!("Migrations applied")
                 }
                 OutputFormat::Json => {
                     println!("{}", serde_json::to_string_pretty(&result)?);
@@ -635,108 +510,15 @@ async fn app(args: Args) -> eyre::Result<()> {
             Ok(())
         }
 
-        Commands::MigrateSearch {
-            env,
-            name,
-            tenant_id,
-            skip_failed,
-        } => {
-            let outcome: MigrateTenantsOutcome = invoke_management_command(
-                &client,
-                &config,
-                ManagementCommand::MigrateSearch(MigrateTenantsSearchConfig {
-                    env,
-                    tenant_id,
-                    skip_failed,
-                    target_migration_name: name,
-                }),
-            )
-            .await?;
+        Commands::MigrateRoot => {
+            interface.migrate_root().await?;
 
             match args.format {
                 OutputFormat::Human => {
-                    let mut table = Table::new();
-                    table
-                        .load_preset(UTF8_FULL)
-                        .apply_modifier(UTF8_ROUND_CORNERS)
-                        .set_content_arrangement(comfy_table::ContentArrangement::Dynamic)
-                        .set_header(vec!["ID", "Name", "Env", "Outcome"]);
-
-                    for tenant in outcome.applied_tenants {
-                        table.add_row(vec![
-                            Cell::new(tenant.tenant_id.to_string()),
-                            Cell::new(tenant.name),
-                            Cell::new(tenant.env),
-                            Cell::new("Success"),
-                        ]);
-                    }
-                    for (error, tenant) in outcome.failed_tenants {
-                        table.add_row(vec![
-                            Cell::new(tenant.tenant_id.to_string()),
-                            Cell::new(tenant.name),
-                            Cell::new(tenant.env),
-                            Cell::new(format!("Failed: {error}")),
-                        ]);
-                    }
-
-                    println!("{table}")
+                    println!("Migrations applied")
                 }
                 OutputFormat::Json => {
-                    println!("{}", serde_json::to_string_pretty(&outcome)?);
-                }
-            }
-
-            Ok(())
-        }
-
-        Commands::MigrateStorage {
-            env,
-            name,
-            tenant_id,
-            skip_failed,
-        } => {
-            let outcome: MigrateTenantsOutcome = invoke_management_command(
-                &client,
-                &config,
-                ManagementCommand::MigrateStorage(MigrateTenantsStorageConfig {
-                    env,
-                    tenant_id,
-                    skip_failed,
-                    target_migration_name: name,
-                }),
-            )
-            .await?;
-
-            match args.format {
-                OutputFormat::Human => {
-                    let mut table = Table::new();
-                    table
-                        .load_preset(UTF8_FULL)
-                        .apply_modifier(UTF8_ROUND_CORNERS)
-                        .set_content_arrangement(comfy_table::ContentArrangement::Dynamic)
-                        .set_header(vec!["ID", "Name", "Env", "Outcome"]);
-
-                    for tenant in outcome.applied_tenants {
-                        table.add_row(vec![
-                            Cell::new(tenant.tenant_id.to_string()),
-                            Cell::new(tenant.name),
-                            Cell::new(tenant.env),
-                            Cell::new("Success"),
-                        ]);
-                    }
-                    for (error, tenant) in outcome.failed_tenants {
-                        table.add_row(vec![
-                            Cell::new(tenant.tenant_id.to_string()),
-                            Cell::new(tenant.name),
-                            Cell::new(tenant.env),
-                            Cell::new(format!("Failed: {error}")),
-                        ]);
-                    }
-
-                    println!("{table}")
-                }
-                OutputFormat::Json => {
-                    println!("{}", serde_json::to_string_pretty(&outcome)?);
+                    println!("{{}}");
                 }
             }
 
@@ -746,27 +528,22 @@ async fn app(args: Args) -> eyre::Result<()> {
         Commands::SetAllowedStorageCorsOrigins {
             env,
             tenant_id,
-            origin,
+            origin: origins,
         } => {
-            let result: serde_json::Value = invoke_management_command(
-                &client,
-                &config,
-                ManagementCommand::SetTenantAllowedCorsOrigins(
-                    SetTenantAllowedCorsOriginsCommand {
-                        env,
-                        tenant_id,
-                        origins: origin,
-                    },
-                ),
-            )
-            .await?;
+            interface
+                .set_tenant_allowed_cors_origins(SetTenantAllowedCorsOriginsInput {
+                    env,
+                    tenant_id,
+                    origins,
+                })
+                .await?;
 
             match args.format {
                 OutputFormat::Human => {
                     println!("updated tenant allowed origins")
                 }
                 OutputFormat::Json => {
-                    println!("{}", serde_json::to_string_pretty(&result)?);
+                    println!("{{}}");
                 }
             }
 
@@ -774,12 +551,9 @@ async fn app(args: Args) -> eyre::Result<()> {
         }
 
         Commands::MigrateTenantIam { env, tenant_id } => {
-            let result: Vec<serde_json::Value> = invoke_management_command(
-                &client,
-                &config,
-                ManagementCommand::MigrateIAM(MigrateTenantIamCommand { env, tenant_id }),
-            )
-            .await?;
+            let result = interface
+                .migrate_tenant_iam(MigrateTenantIAMInput { env, tenant_id })
+                .await?;
 
             match args.format {
                 OutputFormat::Human => {
@@ -790,29 +564,11 @@ async fn app(args: Args) -> eyre::Result<()> {
                         .set_content_arrangement(comfy_table::ContentArrangement::Dynamic)
                         .set_header(vec!["ID", "Name", "Env", "Outcome"]);
 
-                    for tenant in result {
-                        let id = tenant
-                            .get("id")
-                            .context("tenant missing id")?
-                            .as_str()
-                            .context("id was not a string")?;
-
-                        let name = tenant
-                            .get("name")
-                            .context("tenant missing id")?
-                            .as_str()
-                            .context("id was not a string")?;
-
-                        let env = tenant
-                            .get("env")
-                            .context("tenant missing id")?
-                            .as_str()
-                            .context("id was not a string")?;
-
+                    for tenant in result.applied_tenants {
                         table.add_row(vec![
-                            Cell::new(id),
-                            Cell::new(name),
-                            Cell::new(env),
+                            Cell::new(tenant.id),
+                            Cell::new(tenant.name),
+                            Cell::new(tenant.env),
                             Cell::new("Success"),
                         ]);
                     }
@@ -828,38 +584,4 @@ async fn app(args: Args) -> eyre::Result<()> {
             Ok(())
         }
     }
-}
-
-struct FunctionConfig {
-    name: String,
-    qualifier: Option<String>,
-    tenant_id: Option<String>,
-}
-
-async fn invoke_management_command<R>(
-    client: &aws_sdk_lambda::Client,
-    config: &FunctionConfig,
-    command: ManagementCommand,
-) -> eyre::Result<R>
-where
-    R: DeserializeOwned,
-{
-    let message = serde_json::to_string(&command).context("failed to serialize request")?;
-
-    let output = client
-        .invoke()
-        .payload(Blob::new(message))
-        .function_name(&config.name)
-        .set_qualifier(config.qualifier.clone())
-        .set_tenant_id(config.tenant_id.clone())
-        .send()
-        .await?;
-
-    if let Some(error) = output.function_error {
-        return Err(eyre!("management error: {error}"));
-    }
-
-    let payload = output.payload().context("missing response payload")?;
-    let result: R = serde_json::from_slice(payload.as_ref()).context("failed to parse response")?;
-    Ok(result)
 }
